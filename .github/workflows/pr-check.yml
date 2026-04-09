@@ -22,9 +22,8 @@ jobs:
           fetch-depth: 0
 
       # -------------------------------------------------------
-      # 2. コンフリクトチェック
-      #    GitHub API の mergeable フィールドを使って確認する
-      #    ※ 初回はまだ計算中(null)のことがあるため、リトライする
+      # 2. コンフリクトチェック（修正版）
+      #    mergeable_state を使用
       # -------------------------------------------------------
       - name: Check for conflicts
         id: conflict_check
@@ -37,17 +36,17 @@ jobs:
           HAS_CONFLICT="false"
 
           for i in {1..6}; do
-            MERGEABLE=$(gh api repos/$REPO/pulls/$PR_NUMBER --jq '.mergeable')
-            echo "試行 $i: mergeable = $MERGEABLE"
+            STATE=$(gh api repos/$REPO/pulls/$PR_NUMBER --jq '.mergeable_state')
+            echo "試行 $i: mergeable_state = $STATE"
 
-            if [ "$MERGEABLE" = "true" ]; then
+            if [ "$STATE" = "clean" ]; then
               HAS_CONFLICT="false"
               break
-            elif [ "$MERGEABLE" = "false" ]; then
+            elif [ "$STATE" = "dirty" ]; then
               HAS_CONFLICT="true"
               break
             else
-              # null = まだ計算中
+              # unknown / unstable / blocked 等
               sleep 10
             fi
           done
@@ -57,11 +56,6 @@ jobs:
 
       # -------------------------------------------------------
       # 3. 変更ファイルのパスチェック
-      #    【修正①】ファイル名のスペース対応:
-      #      gh api の出力を1行1ファイルの JSON 文字列として取得し
-      #      mapfile で配列に読み込むことでスペースを安全に扱う
-      #    【修正②】マルチライン出力:
-      #      printf で配列を組み立て、heredoc で GITHUB_OUTPUT に書き出す
       # -------------------------------------------------------
       - name: Check changed files
         id: file_check
@@ -74,8 +68,6 @@ jobs:
           echo "変更ファイルチェック開始..."
           echo "PR作成者: $PR_AUTHOR"
 
-          # ファイル名を JSON 文字列配列として取得し、
-          # jq で1行1エントリに展開（スペース含むパスも安全）
           mapfile -t CHANGED_FILES < <(
             gh api repos/$REPO/pulls/$PR_NUMBER/files \
               --paginate \
@@ -84,7 +76,6 @@ jobs:
 
           echo "変更ファイル数: ${#CHANGED_FILES[@]}"
 
-          # 問題ファイルを配列で管理（スペース対応）
           OUTSIDE_FILES_ARR=()
 
           for FILE in "${CHANGED_FILES[@]}"; do
@@ -102,7 +93,6 @@ jobs:
             HAS_OUTSIDE="true"
           fi
 
-          # GITHUB_OUTPUT へ安全なマルチライン書き出し
           {
             echo "has_outside=$HAS_OUTSIDE"
             echo "outside_files<<OUTSIDE_EOF"
@@ -115,7 +105,7 @@ jobs:
           echo "アカウント名フォルダ外の変更有無: $HAS_OUTSIDE"
 
       # -------------------------------------------------------
-      # 4. 結果をまとめてPRにコメント投稿
+      # 4. PRコメント
       # -------------------------------------------------------
       - name: Post PR comment
         env:
@@ -169,7 +159,7 @@ jobs:
             --body "$BODY"
 
       # -------------------------------------------------------
-      # 5. 問題があれば Discord と管理者に通知
+      # 5. 通知
       # -------------------------------------------------------
       - name: Notify Discord and admins
         if: steps.conflict_check.outputs.has_conflict == 'true' || steps.file_check.outputs.has_outside == 'true'
@@ -185,12 +175,10 @@ jobs:
           HAS_OUTSIDE: ${{ steps.file_check.outputs.has_outside }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 問題内容を整理
           ISSUES_TEXT=""
           [ "$HAS_CONFLICT" = "true" ] && ISSUES_TEXT="${ISSUES_TEXT}\n⚠️ コンフリクトが発生しています"
           [ "$HAS_OUTSIDE" = "true" ] && ISSUES_TEXT="${ISSUES_TEXT}\n⚠️ アカウント名フォルダ外のファイルが変更されています"
 
-          # Discord 通知
           if [ -n "$DISCORD_WEBHOOK_URL" ]; then
             ISSUES_ESCAPED=$(printf '%s' "$ISSUES_TEXT" | python3 -c "
           import sys, json
@@ -216,12 +204,8 @@ jobs:
             curl -s -X POST "$DISCORD_WEBHOOK_URL" \
               -H "Content-Type: application/json" \
               -d "$DISCORD_PAYLOAD"
-            echo "Discord通知を送信しました"
-          else
-            echo "DISCORD_WEBHOOK_URL が未設定のためスキップ"
           fi
 
-          # 管理者に GitHub PR コメントでメンション
           if [ -n "$ADMIN_ACCOUNTS" ]; then
             MENTIONS=""
             IFS=',' read -ra ADMINS <<< "$ADMIN_ACCOUNTS"
@@ -233,24 +217,16 @@ jobs:
             ADMIN_BODY="### 🔔 管理者への通知
           ${MENTIONS}
 
-          上記のPRに問題が検出されました。内容を確認し、必要であればマージを承認してください。
+          上記のPRに問題が検出されました。
           $(printf '%b' "$ISSUES_TEXT")"
 
             gh pr comment "$PR_NUMBER" \
               --repo "$REPO" \
               --body "$ADMIN_BODY"
-            echo "管理者へのメンションを送信しました: $MENTIONS"
-          else
-            echo "ADMIN_ACCOUNTS が未設定のためスキップ"
           fi
 
       # -------------------------------------------------------
-      # 6. 【修正③】Approve/Request Changes の廃止
-      #    代わりに GitHub Commit Status で合否を記録する
-      #    - OK   → success  : PR作成者が自分でマージ可能
-      #    - NG   → failure  : Branch Protection により管理者のみマージ可
-      #    Branch Protection 設定:
-      #      "Require status checks: pr-validation" を有効にすること
+      # 6. ステータス設定
       # -------------------------------------------------------
       - name: Set commit status (success)
         if: steps.conflict_check.outputs.has_conflict == 'false' && steps.file_check.outputs.has_outside == 'false'
@@ -264,7 +240,6 @@ jobs:
             -f state=success \
             -f context="pr-validation" \
             -f description="✅ チェックOK: そのままマージできます"
-          echo "ステータス: success"
 
       - name: Set commit status (failure)
         if: steps.conflict_check.outputs.has_conflict == 'true' || steps.file_check.outputs.has_outside == 'true'
@@ -278,4 +253,3 @@ jobs:
             -f state=failure \
             -f context="pr-validation" \
             -f description="❌ チェックNG: 管理者の承認が必要です"
-          echo "ステータス: failure"
