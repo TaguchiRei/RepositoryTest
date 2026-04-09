@@ -1,0 +1,281 @@
+name: UE/Unity PR Validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+  statuses: write
+
+jobs:
+  validate-pr:
+    runs-on: ubuntu-latest
+    steps:
+      # -------------------------------------------------------
+      # 1. リポジトリをチェックアウト
+      # -------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------
+      # 2. コンフリクトチェック
+      #    GitHub API の mergeable フィールドを使って確認する
+      #    ※ 初回はまだ計算中(null)のことがあるため、リトライする
+      # -------------------------------------------------------
+      - name: Check for conflicts
+        id: conflict_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "コンフリクトチェック開始..."
+          HAS_CONFLICT="false"
+
+          for i in {1..6}; do
+            MERGEABLE=$(gh api repos/$REPO/pulls/$PR_NUMBER --jq '.mergeable')
+            echo "試行 $i: mergeable = $MERGEABLE"
+
+            if [ "$MERGEABLE" = "true" ]; then
+              HAS_CONFLICT="false"
+              break
+            elif [ "$MERGEABLE" = "false" ]; then
+              HAS_CONFLICT="true"
+              break
+            else
+              # null = まだ計算中
+              sleep 10
+            fi
+          done
+
+          echo "has_conflict=$HAS_CONFLICT" >> $GITHUB_OUTPUT
+          echo "コンフリクト有無: $HAS_CONFLICT"
+
+      # -------------------------------------------------------
+      # 3. 変更ファイルのパスチェック
+      #    【修正①】ファイル名のスペース対応:
+      #      gh api の出力を1行1ファイルの JSON 文字列として取得し
+      #      mapfile で配列に読み込むことでスペースを安全に扱う
+      #    【修正②】マルチライン出力:
+      #      printf で配列を組み立て、heredoc で GITHUB_OUTPUT に書き出す
+      # -------------------------------------------------------
+      - name: Check changed files
+        id: file_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          echo "変更ファイルチェック開始..."
+          echo "PR作成者: $PR_AUTHOR"
+
+          # ファイル名を JSON 文字列配列として取得し、
+          # jq で1行1エントリに展開（スペース含むパスも安全）
+          mapfile -t CHANGED_FILES < <(
+            gh api repos/$REPO/pulls/$PR_NUMBER/files \
+              --paginate \
+              --jq '.[].filename'
+          )
+
+          echo "変更ファイル数: ${#CHANGED_FILES[@]}"
+
+          # 問題ファイルを配列で管理（スペース対応）
+          OUTSIDE_FILES_ARR=()
+
+          for FILE in "${CHANGED_FILES[@]}"; do
+            [ -z "$FILE" ] && continue
+            if echo "$FILE" | grep -iqE "(^|/)${PR_AUTHOR}(/|$)"; then
+              echo "  OK: $FILE"
+            else
+              echo "  NG: $FILE (アカウント名フォルダ外)"
+              OUTSIDE_FILES_ARR+=("$FILE")
+            fi
+          done
+
+          HAS_OUTSIDE="false"
+          if [ ${#OUTSIDE_FILES_ARR[@]} -gt 0 ]; then
+            HAS_OUTSIDE="true"
+          fi
+
+          # GITHUB_OUTPUT へ安全なマルチライン書き出し
+          {
+            echo "has_outside=$HAS_OUTSIDE"
+            echo "outside_files<<OUTSIDE_EOF"
+            for F in "${OUTSIDE_FILES_ARR[@]}"; do
+              printf -- '- `%s`\n' "$F"
+            done
+            echo "OUTSIDE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "アカウント名フォルダ外の変更有無: $HAS_OUTSIDE"
+
+      # -------------------------------------------------------
+      # 4. 結果をまとめてPRにコメント投稿
+      # -------------------------------------------------------
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HAS_CONFLICT: ${{ steps.conflict_check.outputs.has_conflict }}
+          HAS_OUTSIDE: ${{ steps.file_check.outputs.has_outside }}
+          OUTSIDE_FILES: ${{ steps.file_check.outputs.outside_files }}
+        run: |
+          if [ "$HAS_CONFLICT" = "false" ] && [ "$HAS_OUTSIDE" = "false" ]; then
+            BODY="## ✅ PRチェック結果: 承認
+
+          **@${PR_AUTHOR}** のプルリクエストはすべてのチェックをパスしました。
+          そのままマージできます。
+
+          | チェック項目 | 結果 |
+          |---|---|
+          | コンフリクト | ✅ なし |
+          | 変更ファイルの範囲 | ✅ 自分のフォルダのみ |"
+          else
+            CONFLICT_ROW="| コンフリクト | ✅ なし |"
+            [ "$HAS_CONFLICT" = "true" ] && CONFLICT_ROW="| コンフリクト | ❌ あり |"
+
+            OUTSIDE_ROW="| 変更ファイルの範囲 | ✅ 自分のフォルダのみ |"
+            [ "$HAS_OUTSIDE" = "true" ] && OUTSIDE_ROW="| 変更ファイルの範囲 | ❌ 他者のフォルダへの変更あり |"
+
+            OUTSIDE_DETAIL=""
+            if [ "$HAS_OUTSIDE" = "true" ]; then
+              OUTSIDE_DETAIL="
+
+          ### 📁 アカウント名フォルダ外の変更ファイル
+          ${OUTSIDE_FILES}"
+            fi
+
+            BODY="## ❌ PRチェック結果: 要確認
+
+          **@${PR_AUTHOR}** のプルリクエストに問題が検出されました。
+          管理者のみがマージを承認できます。
+
+          | チェック項目 | 結果 |
+          |---|---|
+          ${CONFLICT_ROW}
+          ${OUTSIDE_ROW}
+          ${OUTSIDE_DETAIL}"
+          fi
+
+          gh pr comment "$PR_NUMBER" \
+            --repo "$REPO" \
+            --body "$BODY"
+
+      # -------------------------------------------------------
+      # 5. 問題があれば Discord と管理者に通知
+      # -------------------------------------------------------
+      - name: Notify Discord and admins
+        if: steps.conflict_check.outputs.has_conflict == 'true' || steps.file_check.outputs.has_outside == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ADMIN_ACCOUNTS: ${{ secrets.ADMIN_ACCOUNTS }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HAS_CONFLICT: ${{ steps.conflict_check.outputs.has_conflict }}
+          HAS_OUTSIDE: ${{ steps.file_check.outputs.has_outside }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 問題内容を整理
+          ISSUES_TEXT=""
+          [ "$HAS_CONFLICT" = "true" ] && ISSUES_TEXT="${ISSUES_TEXT}\n⚠️ コンフリクトが発生しています"
+          [ "$HAS_OUTSIDE" = "true" ] && ISSUES_TEXT="${ISSUES_TEXT}\n⚠️ アカウント名フォルダ外のファイルが変更されています"
+
+          # Discord 通知
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            ISSUES_ESCAPED=$(printf '%s' "$ISSUES_TEXT" | python3 -c "
+          import sys, json
+          print(json.dumps(sys.stdin.read())[1:-1])
+          ")
+            DISCORD_PAYLOAD=$(python3 -c "
+          import json
+          payload = {
+            'embeds': [{
+              'title': f'❌ PRチェック失敗: #{\"$PR_NUMBER\"} $PR_TITLE',
+              'description': (
+                f'**作成者:** @$PR_AUTHOR\n'
+                f'**リポジトリ:** $REPO\n\n'
+                f'**検出された問題:**\n$ISSUES_ESCAPED\n\n'
+                f'[PRを確認する]($PR_URL)'
+              ),
+              'color': 15158332,
+              'footer': {'text': 'GitHub Actions • PR Validation'}
+            }]
+          }
+          print(json.dumps(payload))
+          ")
+            curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$DISCORD_PAYLOAD"
+            echo "Discord通知を送信しました"
+          else
+            echo "DISCORD_WEBHOOK_URL が未設定のためスキップ"
+          fi
+
+          # 管理者に GitHub PR コメントでメンション
+          if [ -n "$ADMIN_ACCOUNTS" ]; then
+            MENTIONS=""
+            IFS=',' read -ra ADMINS <<< "$ADMIN_ACCOUNTS"
+            for ADMIN in "${ADMINS[@]}"; do
+              ADMIN=$(echo "$ADMIN" | tr -d ' ')
+              MENTIONS="${MENTIONS} @${ADMIN}"
+            done
+
+            ADMIN_BODY="### 🔔 管理者への通知
+          ${MENTIONS}
+
+          上記のPRに問題が検出されました。内容を確認し、必要であればマージを承認してください。
+          $(printf '%b' "$ISSUES_TEXT")"
+
+            gh pr comment "$PR_NUMBER" \
+              --repo "$REPO" \
+              --body "$ADMIN_BODY"
+            echo "管理者へのメンションを送信しました: $MENTIONS"
+          else
+            echo "ADMIN_ACCOUNTS が未設定のためスキップ"
+          fi
+
+      # -------------------------------------------------------
+      # 6. 【修正③】Approve/Request Changes の廃止
+      #    代わりに GitHub Commit Status で合否を記録する
+      #    - OK   → success  : PR作成者が自分でマージ可能
+      #    - NG   → failure  : Branch Protection により管理者のみマージ可
+      #    Branch Protection 設定:
+      #      "Require status checks: pr-validation" を有効にすること
+      # -------------------------------------------------------
+      - name: Set commit status (success)
+        if: steps.conflict_check.outputs.has_conflict == 'false' && steps.file_check.outputs.has_outside == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api repos/$REPO/statuses/$SHA \
+            -X POST \
+            -f state=success \
+            -f context="pr-validation" \
+            -f description="✅ チェックOK: そのままマージできます"
+          echo "ステータス: success"
+
+      - name: Set commit status (failure)
+        if: steps.conflict_check.outputs.has_conflict == 'true' || steps.file_check.outputs.has_outside == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api repos/$REPO/statuses/$SHA \
+            -X POST \
+            -f state=failure \
+            -f context="pr-validation" \
+            -f description="❌ チェックNG: 管理者の承認が必要です"
+          echo "ステータス: failure"
